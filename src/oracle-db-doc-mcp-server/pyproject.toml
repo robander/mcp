@@ -11,3 +11,20 @@ dependencies = [
     "pocketsearch>=0.40.0",
     "pydantic>=2.12.3"
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.0.0",
+]
+
+[tool.coverage.run]
+omit = [
+    "test_*.py",
+    "dist/*",
+    ".venv/*",
+]
+
+[tool.coverage.report]
+precision = 2
+fail_under = 90

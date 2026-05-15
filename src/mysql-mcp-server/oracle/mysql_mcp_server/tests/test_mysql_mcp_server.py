@@ -94,6 +94,13 @@ def get_first_valid_connection_id(desired_mode=None, db_key=None):
     raise Exception(f"No valid connections for mode {desired_mode}")
 
 
+def get_required_connection_id(desired_mode=None, db_key=None):
+    try:
+        return get_first_valid_connection_id(desired_mode=desired_mode, db_key=db_key)
+    except Exception as exc:
+        raise unittest.SkipTest(f"No valid configured MySQL connection: {exc}") from exc
+
+
 try:
     get_first_valid_connection_id(Mode.MYSQL_AI)
     SKIP_MYSQL_AI = False
@@ -293,7 +300,9 @@ class TestDbConnectionUtilities(unittest.TestCase):
         }
         mock_conn = mock.Mock(name="MySQLConnection")
 
-        with mock.patch.object(m, "config", cfg), mock.patch.object(
+        with mock.patch.object(m, "config_error_msg", None), mock.patch.object(
+            m, "config", cfg
+        ), mock.patch.object(
             m.connector, "connect", return_value=mock_conn
         ) as connect_mock:
             conn = m._get_db_connection("good")
@@ -302,20 +311,26 @@ class TestDbConnectionUtilities(unittest.TestCase):
         connect_mock.assert_called_once_with(**cfg["server_infos"]["good"])
 
     def test_get_db_connection_invalid_id_raises(self):
-        with mock.patch.object(m, "config", {"server_infos": {}}):
+        with mock.patch.object(m, "config_error_msg", None), mock.patch.object(
+            m, "config", {"server_infos": {}}
+        ):
             with self.assertRaises(m.DatabaseConnectionError) as ctx:
                 m._get_db_connection("nope")
         self.assertIn("is not a valid connection", str(ctx.exception))
 
     def test_get_db_connection_missing_database_key_raises(self):
-        with mock.patch.object(m, "config", {"server_infos": {"bad": {"host": "h", "user": "u"}}}):
+        with mock.patch.object(m, "config_error_msg", None), mock.patch.object(
+            m, "config", {"server_infos": {"bad": {"host": "h", "user": "u"}}}
+        ):
             with self.assertRaises(m.DatabaseConnectionError) as ctx:
                 m._get_db_connection("bad")
         self.assertIn("Database must be specified in config", str(ctx.exception))
 
     def test_get_db_connection_connect_failure_wrapped(self):
         cfg = {"server_infos": {"good": {"database": "testdb", "user": "u"}}}
-        with mock.patch.object(m, "config", cfg), mock.patch.object(
+        with mock.patch.object(m, "config_error_msg", None), mock.patch.object(
+            m, "config", cfg
+        ), mock.patch.object(
             m.connector, "connect", side_effect=RuntimeError("driver down")
         ):
             with self.assertRaises(m.DatabaseConnectionError) as ctx:
@@ -363,6 +378,8 @@ class TestListAllConnections(unittest.TestCase):
         with mock.patch.object(
             src_module, "config", cfg, create=True
         ), mock.patch.object(
+            src_module, "config_error_msg", None, create=True
+        ), mock.patch.object(
             src_module, "_get_database_connection_cm", new=ok_cm
         ), mock.patch.object(
             src_module, "_get_mode", return_value=src_module.Mode.MYSQL_AI
@@ -391,6 +408,8 @@ class TestListAllConnections(unittest.TestCase):
 
         with mock.patch.object(
             src_module, "config", cfg, create=True
+        ), mock.patch.object(
+            src_module, "config_error_msg", None, create=True
         ), mock.patch.object(
             src_module, "_get_database_connection_cm", new=mixed_cm
         ), mock.patch.object(
@@ -423,6 +442,8 @@ class TestListAllConnections(unittest.TestCase):
         with mock.patch.object(
             src_module, "config", cfg, create=True
         ), mock.patch.object(
+            src_module, "config_error_msg", None, create=True
+        ), mock.patch.object(
             src_module, "_get_database_connection_cm", side_effect=failing_cm
         ):
             out = src_module.list_all_connections()
@@ -436,13 +457,17 @@ class TestListAllConnections(unittest.TestCase):
             self.assertIn("cannot connect", e["error"])
 
     def test_list_all_connections_empty_config_mocked(self):
-        with mock.patch.object(src_module, "config", {"server_infos": {}}, create=True):
+        with mock.patch.object(
+            src_module, "config", {"server_infos": {}}, create=True
+        ), mock.patch.object(src_module, "config_error_msg", None, create=True):
             out = src_module.list_all_connections()
         payload = json.loads(out)
         self.assertEqual(payload["valid keys"], [])
         self.assertEqual(payload["invalid keys"], [])
 
     def test_list_all_connections_real_json_and_at_least_one_valid(self):
+        if src_module.config_error_msg is not None:
+            self.skipTest(src_module.config_error_msg)
         out = src_module.list_all_connections()
         self.assertIsInstance(out, str)
         payload = json.loads(out)
@@ -458,11 +483,6 @@ class TestListAllConnections(unittest.TestCase):
 
 
 class TestExecuteSqlTool(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.conn_id = get_first_valid_connection_id()
-
     # ---- Minimal mocking for exception/error branches ----
     def test_execute_sql_tool_connection_id_connect_failure_returns_error_json(self):
         with mock.patch.object(
@@ -557,32 +577,30 @@ class TestExecuteSqlTool(unittest.TestCase):
         inner.assert_called_once_with("cid", "SELECT 1", params=[42])
 
     def test_real_valid_select_no_error(self):
-        out = src_module.execute_sql_tool_by_connection_id(self.conn_id, "SELECT 1")
+        conn_id = get_required_connection_id()
+        out = src_module.execute_sql_tool_by_connection_id(conn_id, "SELECT 1")
         self.assertFalse(src_module.check_error(out))
         data = json.loads(out)
         self.assertIsInstance(data, list)
 
     def test_real_semantically_invalid_no_error(self):
+        conn_id = get_required_connection_id()
         # MySQL typically returns NULL (with warning) for division by zero rather than an error
-        out = src_module.execute_sql_tool_by_connection_id(self.conn_id, "SELECT 1/0")
+        out = src_module.execute_sql_tool_by_connection_id(conn_id, "SELECT 1/0")
         self.assertFalse(src_module.check_error(out))
         data = json.loads(out)
         self.assertIsInstance(data, list)
 
     def test_real_valid_multi_select_error(self):
+        conn_id = get_required_connection_id()
         # Multiple selects are not supported currently
-        out = src_module.execute_sql_tool_by_connection_id(self.conn_id, "SELECT 1; SELECT 2;")
+        out = src_module.execute_sql_tool_by_connection_id(conn_id, "SELECT 1; SELECT 2;")
         self.assertFalse(src_module.check_error(out))
         data = json.loads(out)
         self.assertEqual(data, [[1], [2]])
 
 
 class TestMlGenerate(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.conn_id = get_first_valid_connection_id()
-
     def test_ml_generate_returns_plain_text_on_success(self):
         # Simulate SELECT sys.ML_GENERATE returning a single-row JSON string with {"text": "..."}
         row = json.dumps({"text": "hello world"})
@@ -643,17 +661,13 @@ class TestMlGenerate(unittest.TestCase):
         self.assertIn("Unexpected response format", json.loads(out)["error"])
 
     def test_ml_generate_real(self):
-        out = src_module.ml_generate(self.conn_id, "Hello from test")
+        conn_id = get_required_connection_id()
+        out = src_module.ml_generate(conn_id, "Hello from test")
         self.assertFalse(src_module.check_error(out))
         self.assertIsInstance(out, str)
 
 
 class TestRagifyColumn(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.conn_id = get_first_valid_connection_id()
-
     def test_ragify_column_success_mocked(self):
         class FakeConn:
             database = "test_schema"
@@ -729,6 +743,7 @@ class TestRagifyColumn(unittest.TestCase):
         self.assertFalse(src_module.check_error(out))
 
     def test_ragify_column_real(self):
+        conn_id = get_required_connection_id()
         table = f"gc_docs_{uuid.uuid4().hex[:8]}"
         text_col = "body"
         embed_col = "embedding"
@@ -736,17 +751,17 @@ class TestRagifyColumn(unittest.TestCase):
         try:
             # Create table with a primary key
             create_sql = f"CREATE TABLE {table} (id INT PRIMARY KEY AUTO_INCREMENT, {text_col} TEXT)"
-            out = src_module.execute_sql_tool_by_connection_id(self.conn_id, create_sql)
+            out = src_module.execute_sql_tool_by_connection_id(conn_id, create_sql)
             self.assertFalse(src_module.check_error(out), f"create table failed: {out}")
 
             # Insert at least two rows
             ins1 = src_module.execute_sql_tool_by_connection_id(
-                self.conn_id,
+                conn_id,
                 f"INSERT INTO {table} ({text_col}) VALUES (%s)",
                 params=["row one"],
             )
             ins2 = src_module.execute_sql_tool_by_connection_id(
-                self.conn_id,
+                conn_id,
                 f"INSERT INTO {table} ({text_col}) VALUES (%s)",
                 params=["row two"],
             )
@@ -754,7 +769,7 @@ class TestRagifyColumn(unittest.TestCase):
             self.assertFalse(src_module.check_error(ins2), f"insert 2 failed: {ins2}")
 
             # Run ragify and require success
-            result = src_module.ragify_column(self.conn_id, table, text_col, embed_col)
+            result = src_module.ragify_column(conn_id, table, text_col, embed_col)
             self.assertFalse(
                 src_module.check_error(result), f"ragify_column failed: {result}"
             )
@@ -762,7 +777,7 @@ class TestRagifyColumn(unittest.TestCase):
             self.assertTrue(result.startswith("Successfully added embedding column"))
         finally:
             src_module.execute_sql_tool_by_connection_id(
-                self.conn_id, f"DROP TABLE IF EXISTS {table}"
+                conn_id, f"DROP TABLE IF EXISTS {table}"
             )
 
 
@@ -1052,11 +1067,6 @@ class TestAskMlRagVectorStore(unittest.TestCase):
 
 
 class TestAskMlRagInnoDB(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.conn_id = get_first_valid_connection_id()
-
     def test_validation_error_for_bad_names(self):
         with mock.patch.object(
             src_module, "_validate_name", side_effect=ValueError("bad name")
@@ -1100,10 +1110,11 @@ class TestAskMlRagInnoDB(unittest.TestCase):
         self.assertIn("ml_rag err", json.loads(out)["error"])
 
     def test_real_nonexistent_columns_error(self):
+        conn_id = get_required_connection_id()
         # Choose a table name that likely doesn't exist or columns that don't exist
         # We call ask_ml_rag_innodb; it should return an error JSON via helper path when server rejects it.
         out = src_module.ask_ml_rag_innodb(
-            self.conn_id,
+            conn_id,
             "What content is available?",
             "no_such_segment",
             "no_such_embedding",
@@ -1114,6 +1125,7 @@ class TestAskMlRagInnoDB(unittest.TestCase):
         )
 
     def test_real_success_on_populated_table(self):
+        conn_id = get_required_connection_id()
         # Create a temp table, insert rows, ragify to create embeddings, then run ask_ml_rag_innodb.
         table = f"gc_innodb_{uuid.uuid4().hex[:8]}"
         segment_col = "body"
@@ -1122,13 +1134,13 @@ class TestAskMlRagInnoDB(unittest.TestCase):
         try:
             # Create table with primary key
             create_sql = f"CREATE TABLE {table} (id INT PRIMARY KEY AUTO_INCREMENT, {segment_col} TEXT)"
-            out = src_module.execute_sql_tool_by_connection_id(self.conn_id, create_sql)
+            out = src_module.execute_sql_tool_by_connection_id(conn_id, create_sql)
             self.assertFalse(src_module.check_error(out), f"create table failed: {out}")
 
             rows = [f"row {i}" for i in range(1, 6)]
             for r in rows:
                 ins = src_module.execute_sql_tool_by_connection_id(
-                    self.conn_id,
+                    conn_id,
                     f"INSERT INTO {table} ({segment_col}) VALUES (%s)",
                     params=[r],
                 )
@@ -1136,7 +1148,7 @@ class TestAskMlRagInnoDB(unittest.TestCase):
 
             # Ragify to create/populate embedding column
             res = src_module.ragify_column(
-                self.conn_id, table, segment_col, embedding_col
+                conn_id, table, segment_col, embedding_col
             )
             self.assertFalse(
                 src_module.check_error(res), f"ragify_column failed: {res}"
@@ -1144,7 +1156,7 @@ class TestAskMlRagInnoDB(unittest.TestCase):
 
             # Now query via ask_ml_rag_innodb
             out = src_module.ask_ml_rag_innodb(
-                self.conn_id, "Find information across rows", segment_col, embedding_col
+                conn_id, "Find information across rows", segment_col, embedding_col
             )
             self.assertFalse(
                 src_module.check_error(out), f"ask_ml_rag_innodb failed: {out}"
@@ -1154,7 +1166,7 @@ class TestAskMlRagInnoDB(unittest.TestCase):
             self.assertGreater(len(json.loads(out)['citations']), 0)
         finally:
             src_module.execute_sql_tool_by_connection_id(
-                self.conn_id, f"DROP TABLE IF EXISTS {table}"
+                conn_id, f"DROP TABLE IF EXISTS {table}"
             )
 
 
